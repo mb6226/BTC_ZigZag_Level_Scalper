@@ -1,0 +1,31 @@
+name: Download BTC 1m OHLC data
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/download-btc-1m.yml"
+      - "scripts/download_btc_1m.py"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  download:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download trailing 1 year of BTCUSDT 1m spot OHLCV
+        run: python scripts/download_btc_1m.py
+
+      - name: Commit dataset
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/BTCUSDT_1m_1y.csv
+          git diff --cached --quiet && exit 0
+          git commit -m "data: add trailing 1y BTCUSDT 1m OHLCV [skip ci]"
+          git push
