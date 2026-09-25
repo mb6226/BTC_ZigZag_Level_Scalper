@@ -23,8 +23,10 @@ jobs:
       - name: Install dependencies
         run: python -m pip install --upgrade pip pandas numpy
 
-      - name: Download / refresh BTC 1m data
-        run: python scripts/download_btc_1m.py
+      - name: Verify existing BTC 1m data
+        run: |
+          test -f data/BTCUSDT_1m_1y.csv
+          ls -lh data/BTCUSDT_1m_1y.csv
 
       - name: Run optimizer
         run: python scripts/optimize_btc_strategy.py
