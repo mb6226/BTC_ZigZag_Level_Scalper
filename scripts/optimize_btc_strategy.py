@@ -39,7 +39,17 @@ def load_data() -> pd.DataFrame:
     t = cols.get("timestamp") or cols.get("open_time") or cols.get("time")
     if not t:
         raise RuntimeError("No timestamp column found")
-    df["timestamp"] = pd.to_datetime(df[t], utc=True)
+    raw_ts = pd.to_numeric(df[t], errors="coerce")
+    sample = raw_ts.dropna().iloc[0]
+    if sample >= 1e17:
+        unit = "us"
+    elif sample >= 1e14:
+        unit = "us"
+    elif sample >= 1e11:
+        unit = "ms"
+    else:
+        unit = "s"
+    df["timestamp"] = pd.to_datetime(raw_ts, unit=unit, utc=True)
     df = df.sort_values("timestamp").drop_duplicates("timestamp")
     for c in ("open", "high", "low", "close"):
         if c not in cols:
