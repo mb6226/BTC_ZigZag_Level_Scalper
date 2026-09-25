@@ -106,7 +106,7 @@ def leg_stats(pivots):
     return legs
 
 
-def run_grid(df: pd.DataFrame, spacing_type: str, spacing_value: float,
+def run_grid(df: pd.DataFrame, pivots, spacing_type: str, spacing_value: float,
              max_layers: int, tp_mult: float):
     """Long-only spot grid, no SL.
 
@@ -120,11 +120,9 @@ def run_grid(df: pd.DataFrame, spacing_type: str, spacing_value: float,
     close = df["close"].to_numpy()
     low = df["low"].to_numpy()
     ts = df["timestamp"].to_numpy()
-    piv = zigzag_pivots(close, 0.01, 20, 5)  # structure gate; strategy sweep below refines ZZ
-    down_legs = {(b, e): pct for b, e, pct, ta, tb in leg_stats(piv)
+    down_ends = {e for a, e, pct, ta, tb in leg_stats(pivots)
                  if ta == "H" and tb == "L" and pct >= MIN_LEG_PCT}
-
-    if not down_legs:
+    if not down_ends:
         return None
 
     trades = []
@@ -142,12 +140,17 @@ def run_grid(df: pd.DataFrame, spacing_type: str, spacing_value: float,
         if p < MIN_PRICE:
             continue
         # A confirmed down-leg endpoint activates a new buying cycle.
-        if any(e == i for _, e in down_legs):
+        if i in down_ends and layers == 0:
             anchor = p
             layers = 0
             spent = 0.0
             btc = 0.0
-            next_buy = p
+            allocation = cash / max_layers
+            qty = allocation / p
+            cash -= allocation
+            spent += allocation
+            btc += qty
+            layers = 1
 
         if anchor is None:
             continue
@@ -206,18 +209,44 @@ def main():
     OUT.mkdir(parents=True, exist_ok=True)
     print(f"Loaded {len(df):,} candles; {df.timestamp.min()} -> {df.timestamp.max()}")
 
-    # First pass: optimize the grid mechanics aggressively.
+    close = df["close"].to_numpy()
+    zz_rows = []
+    for depth, dev, backstep in itertools.product(DEPTHS, DEVIATIONS_PCT, BACKSTEPS):
+        piv = zigzag_pivots(close, dev / 100.0, depth, backstep)
+        legs = leg_stats(piv)
+        down = [x for x in legs if x[3] == "H" and x[4] == "L" and x[2] >= MIN_LEG_PCT]
+        if down:
+            zz_rows.append({
+                "depth": depth, "deviation_pct": dev, "backstep": backstep,
+                "down_legs": len(down),
+                "median_leg_pct": float(np.median([x[2] for x in down])),
+            })
+
+    if not zz_rows:
+        raise RuntimeError("No >=2.5% downward ZigZag legs found.")
+
+    zz_df = pd.DataFrame(zz_rows).sort_values(
+        ["down_legs", "median_leg_pct"], ascending=False
+    )
+    top_zz = zz_df.head(20)
+
     rows = []
-    for st, sv, ml, tm in itertools.product(
-        ["pct", "usd"], SPACING_PCT + SPACING_USD, MAX_LAYERS, [0.75, 1.0, 1.25, 1.5, 2.0]
-    ):
-        if st == "pct" and sv not in SPACING_PCT:
-            continue
-        if st == "usd" and sv not in SPACING_USD:
-            continue
-        r = run_grid(df, st, sv, ml, tm)
-        if r:
-            rows.append({"spacing_type": st, "spacing": sv, "max_layers": ml, "tp_multiple": tm, **r})
+    for _, z in top_zz.iterrows():
+        depth = int(z["depth"])
+        dev = float(z["deviation_pct"])
+        backstep = int(z["backstep"])
+        piv = zigzag_pivots(close, dev / 100.0, depth, backstep)
+
+        for st, sv, ml, tm in itertools.product(
+            ["pct", "usd"], SPACING_PCT + SPACING_USD, MAX_LAYERS, [0.75, 1.0, 1.25, 1.5, 2.0]
+        ):
+            r = run_grid(df, piv, st, sv, ml, tm)
+            if r:
+                rows.append({
+                    "depth": depth, "deviation_pct": dev, "backstep": backstep,
+                    "spacing_type": st, "spacing": sv, "max_layers": ml,
+                    "tp_multiple": tm, **r
+                })
 
     out = pd.DataFrame(rows)
     if out.empty:
