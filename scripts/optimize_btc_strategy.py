@@ -24,7 +24,6 @@ OUT = Path("results")
 MIN_PRICE = 30_000.0
 MIN_LEG_PCT = 0.025
 
-# Broad brute-force ranges. Expand later if the best result lands on a boundary.
 DEPTHS = [5, 10, 15, 20, 30, 40, 60, 90]
 DEVIATIONS_PCT = [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 2.5]
 BACKSTEPS = [2, 3, 5, 8, 10, 15]
@@ -42,7 +41,7 @@ def load_data() -> pd.DataFrame:
     raw_ts = pd.to_numeric(df[t], errors="coerce")
     sample = raw_ts.dropna().iloc[0]
     if sample >= 1e17:
-        unit = "us"
+        unit = "ns"
     elif sample >= 1e14:
         unit = "us"
     elif sample >= 1e11:
@@ -61,40 +60,67 @@ def load_data() -> pd.DataFrame:
 
 
 def zigzag_pivots(close: np.ndarray, deviation_pct: float, depth: int, backstep: int):
-    """Causal swing detector.
+    """Causal percentage ZigZag.
 
-    A pivot is confirmed only after price moves by deviation_pct from the
-    candidate extreme and the minimum depth/backstep constraints are met.
-    This is intentionally causal so the optimizer does not use future pivots
-    as if they were known at the pivot candle.
+    The previous implementation could remain in an unconfirmed state because
+    it mixed the initial neutral state with both directional branches. This
+    version explicitly bootstraps the first swing, then alternates H -> L -> H.
+
+    A pivot is confirmed only after:
+      1) the candidate extreme has remained in place for depth bars, and
+      2) price reverses by at least deviation_pct.
+    backstep is enforced between confirmed pivots.
     """
     n = len(close)
-    pivots = []
     if n < depth + 2:
-        return pivots
+        return []
 
+    pivots = []
     direction = 0
     candidate_i = 0
-    candidate_p = close[0]
+    candidate_p = float(close[0])
 
     for i in range(1, n):
-        p = close[i]
-        if direction >= 0:
-            if p >= candidate_p:
+        p = float(close[i])
+
+        if direction == 0:
+            if p > candidate_p:
                 candidate_i, candidate_p = i, p
-            if candidate_p > 0 and p <= candidate_p * (1 - deviation_pct):
-                if i - candidate_i >= depth and (not pivots or candidate_i - pivots[-1][0] >= backstep):
+            elif p < candidate_p:
+                candidate_i, candidate_p = i, p
+
+            if i >= depth:
+                move = p / candidate_p - 1.0
+                if move <= -deviation_pct:
                     pivots.append((candidate_i, candidate_p, "H"))
                     direction = -1
                     candidate_i, candidate_p = i, p
-        if direction <= 0:
-            if p <= candidate_p:
-                candidate_i, candidate_p = i, p
-            if candidate_p > 0 and p >= candidate_p * (1 + deviation_pct):
-                if i - candidate_i >= depth and (not pivots or candidate_i - pivots[-1][0] >= backstep):
+                elif move >= deviation_pct:
                     pivots.append((candidate_i, candidate_p, "L"))
                     direction = 1
                     candidate_i, candidate_p = i, p
+            continue
+
+        if direction == 1:
+            if p >= candidate_p:
+                candidate_i, candidate_p = i, p
+                continue
+            if i - candidate_i >= depth and p <= candidate_p * (1.0 - deviation_pct):
+                if not pivots or candidate_i - pivots[-1][0] >= backstep:
+                    pivots.append((candidate_i, candidate_p, "H"))
+                    direction = -1
+                    candidate_i, candidate_p = i, p
+            continue
+
+        if p <= candidate_p:
+            candidate_i, candidate_p = i, p
+            continue
+        if i - candidate_i >= depth and p >= candidate_p * (1.0 + deviation_pct):
+            if not pivots or candidate_i - pivots[-1][0] >= backstep:
+                pivots.append((candidate_i, candidate_p, "L"))
+                direction = 1
+                candidate_i, candidate_p = i, p
+
     return pivots
 
 
@@ -108,17 +134,7 @@ def leg_stats(pivots):
 
 def run_grid(df: pd.DataFrame, pivots, spacing_type: str, spacing_value: float,
              max_layers: int, tp_mult: float):
-    """Long-only spot grid, no SL.
-
-    Start a cycle after a >=2.5% confirmed downward swing. Buy one tranche
-    when price reaches the next grid level below the cycle anchor; add up to
-    max_layers. Exit all accumulated BTC when price rebounds by TP multiple
-    of the chosen spacing from the volume-weighted average entry.
-
-    Capital is divided equally among layers. No leverage and no shorting.
-    """
     close = df["close"].to_numpy()
-    low = df["low"].to_numpy()
     ts = df["timestamp"].to_numpy()
     down_ends = {e for a, e, pct, ta, tb in leg_stats(pivots)
                  if ta == "H" and tb == "L" and pct >= MIN_LEG_PCT}
@@ -130,21 +146,19 @@ def run_grid(df: pd.DataFrame, pivots, spacing_type: str, spacing_value: float,
     btc = 0.0
     spent = 0.0
     anchor = None
-    next_buy = None
     layers = 0
-    last_equity = cash
     peak = cash
     max_dd = 0.0
 
     for i, p in enumerate(close):
         if p < MIN_PRICE:
             continue
-        # A confirmed down-leg endpoint activates a new buying cycle.
+
         if i in down_ends and layers == 0:
             anchor = p
-            layers = 0
             spent = 0.0
             btc = 0.0
+            layers = 0
             allocation = cash / max_layers
             qty = allocation / p
             cash -= allocation
@@ -156,7 +170,7 @@ def run_grid(df: pd.DataFrame, pivots, spacing_type: str, spacing_value: float,
             continue
 
         step = (spacing_value / 100.0) if spacing_type == "pct" else spacing_value / anchor
-        buy_level = anchor * (1 - step * (layers + 1))
+        buy_level = anchor * (1.0 - step * (layers + 1))
         if layers < max_layers and p <= buy_level and cash > 0:
             allocation = cash / (max_layers - layers)
             qty = allocation / p
@@ -167,7 +181,7 @@ def run_grid(df: pd.DataFrame, pivots, spacing_type: str, spacing_value: float,
 
         if layers:
             avg = spent / btc
-            tp = avg * (1 + step * tp_mult)
+            tp = avg * (1.0 + step * tp_mult)
             if p >= tp:
                 proceeds = btc * p
                 pnl = proceeds - spent
@@ -180,7 +194,6 @@ def run_grid(df: pd.DataFrame, pivots, spacing_type: str, spacing_value: float,
                 spent = 0.0
                 layers = 0
                 anchor = None
-                next_buy = None
 
         equity = cash + btc * p
         peak = max(peak, equity)
@@ -188,8 +201,12 @@ def run_grid(df: pd.DataFrame, pivots, spacing_type: str, spacing_value: float,
 
     if not trades:
         return None
+
     tr = pd.DataFrame(trades)
-    monthly = tr.assign(month=pd.to_datetime(tr.timestamp).dt.to_period("M")).groupby("month")["pnl"].sum()
+    monthly = (
+        tr.assign(month=pd.to_datetime(tr.timestamp).dt.to_period("M"))
+        .groupby("month")["pnl"].sum()
+    )
     return {
         "trades": len(tr),
         "total_return_pct": (cash - 1.0) * 100,
@@ -211,25 +228,35 @@ def main():
 
     close = df["close"].to_numpy()
     zz_rows = []
+
     for depth, dev, backstep in itertools.product(DEPTHS, DEVIATIONS_PCT, BACKSTEPS):
         piv = zigzag_pivots(close, dev / 100.0, depth, backstep)
         legs = leg_stats(piv)
-        down = [x for x in legs if x[3] == "H" and x[4] == "L" and x[2] >= MIN_LEG_PCT]
+        down = [
+            x for x in legs
+            if x[3] == "H" and x[4] == "L" and x[2] >= MIN_LEG_PCT
+        ]
         zz_rows.append({
-            "depth": depth, "deviation_pct": dev, "backstep": backstep,
+            "depth": depth,
+            "deviation_pct": dev,
+            "backstep": backstep,
             "down_legs": len(down),
             "median_leg_pct": float(np.median([x[2] for x in down])) if down else 0.0,
             "all_legs": len(legs),
         })
 
     zz_df = pd.DataFrame(zz_rows)
+    zz_df = zz_df.sort_values(
+        ["down_legs", "median_leg_pct", "all_legs"],
+        ascending=False
+    ).reset_index(drop=True)
+
     print("ZigZag sweep: max >=2.5% down legs =", int(zz_df.down_legs.max()))
-    print(zz_df.sort_values(["down_legs", "median_leg_pct"], ascending=False).head(10).to_string(index=False))
+    print(zz_df.head(10).to_string(index=False))
 
     if zz_df.down_legs.max() == 0:
         raise RuntimeError("ZigZag detector found no >=2.5% downward legs; inspect detector/grid.")
 
-    top_zz = zz_df.sort_values(["down_legs", "median_leg_pct"], ascending=False).head(20)
     top_zz = zz_df.head(20)
 
     rows = []
@@ -240,20 +267,32 @@ def main():
         piv = zigzag_pivots(close, dev / 100.0, depth, backstep)
 
         for st, sv, ml, tm in itertools.product(
-            ["pct", "usd"], SPACING_PCT + SPACING_USD, MAX_LAYERS, [0.75, 1.0, 1.25, 1.5, 2.0]
+            ["pct", "usd"],
+            SPACING_PCT + SPACING_USD,
+            MAX_LAYERS,
+            [0.75, 1.0, 1.25, 1.5, 2.0],
         ):
             r = run_grid(df, piv, st, sv, ml, tm)
             if r:
                 rows.append({
-                    "depth": depth, "deviation_pct": dev, "backstep": backstep,
-                    "spacing_type": st, "spacing": sv, "max_layers": ml,
-                    "tp_multiple": tm, **r
+                    "depth": depth,
+                    "deviation_pct": dev,
+                    "backstep": backstep,
+                    "spacing_type": st,
+                    "spacing": sv,
+                    "max_layers": ml,
+                    "tp_multiple": tm,
+                    **r,
                 })
 
     out = pd.DataFrame(rows)
     if out.empty:
         raise RuntimeError("No completed trades. Broaden the strategy grid.")
-    out = out.sort_values(["avg_monthly_return_pct", "total_return_pct"], ascending=False)
+
+    out = out.sort_values(
+        ["avg_monthly_return_pct", "total_return_pct"],
+        ascending=False,
+    )
     out.to_csv(OUT / "top_setups.csv", index=False)
     print(out.head(30).to_string(index=False))
 
