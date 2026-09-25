@@ -215,19 +215,21 @@ def main():
         piv = zigzag_pivots(close, dev / 100.0, depth, backstep)
         legs = leg_stats(piv)
         down = [x for x in legs if x[3] == "H" and x[4] == "L" and x[2] >= MIN_LEG_PCT]
-        if down:
-            zz_rows.append({
-                "depth": depth, "deviation_pct": dev, "backstep": backstep,
-                "down_legs": len(down),
-                "median_leg_pct": float(np.median([x[2] for x in down])),
-            })
+        zz_rows.append({
+            "depth": depth, "deviation_pct": dev, "backstep": backstep,
+            "down_legs": len(down),
+            "median_leg_pct": float(np.median([x[2] for x in down])) if down else 0.0,
+            "all_legs": len(legs),
+        })
 
-    if not zz_rows:
-        raise RuntimeError("No >=2.5% downward ZigZag legs found.")
+    zz_df = pd.DataFrame(zz_rows)
+    print("ZigZag sweep: max >=2.5% down legs =", int(zz_df.down_legs.max()))
+    print(zz_df.sort_values(["down_legs", "median_leg_pct"], ascending=False).head(10).to_string(index=False))
 
-    zz_df = pd.DataFrame(zz_rows).sort_values(
-        ["down_legs", "median_leg_pct"], ascending=False
-    )
+    if zz_df.down_legs.max() == 0:
+        raise RuntimeError("ZigZag detector found no >=2.5% downward legs; inspect detector/grid.")
+
+    top_zz = zz_df.sort_values(["down_legs", "median_leg_pct"], ascending=False).head(20)
     top_zz = zz_df.head(20)
 
     rows = []
