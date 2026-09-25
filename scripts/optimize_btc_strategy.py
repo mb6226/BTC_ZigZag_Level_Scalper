@@ -121,95 +121,127 @@ def leg_stats(pivots):
     ]
 
 
-def run_grid(
-    df: pd.DataFrame,
-    pivots,
-    spacing_type: str,
-    spacing_value: float,
-    max_layers: int,
-    tp_mult: float,
-):
+class RangeTree:
+    """Segment tree for first close crossing a threshold after an index."""
+
+    def __init__(self, values):
+        n = len(values)
+        size = 1
+        while size < n:
+            size *= 2
+        self.n = n
+        self.size = size
+        self.minv = np.full(2 * size, np.inf, dtype=np.float64)
+        self.maxv = np.full(2 * size, -np.inf, dtype=np.float64)
+        self.minv[size:size + n] = values
+        self.maxv[size:size + n] = values
+        for i in range(size - 1, 0, -1):
+            self.minv[i] = min(self.minv[2*i], self.minv[2*i+1])
+            self.maxv[i] = max(self.maxv[2*i], self.maxv[2*i+1])
+
+    def first_le(self, start, threshold):
+        return self._first(start, threshold, True)
+
+    def first_ge(self, start, threshold):
+        return self._first(start, threshold, False)
+
+    def _first(self, start, threshold, le):
+        if start >= self.n:
+            return None
+
+        def walk(node, left, right):
+            if right <= start:
+                return None
+            extreme = self.minv[node] if le else self.maxv[node]
+            if (le and extreme > threshold) or ((not le) and extreme < threshold):
+                return None
+            if right - left == 1:
+                return left if left < self.n else None
+            mid = (left + right) // 2
+            hit = walk(node * 2, left, mid)
+            return hit if hit is not None else walk(node * 2 + 1, mid, right)
+
+        return walk(1, 0, self.size)
+
+
+def run_grid(df, pivots, spacing_type, spacing_value, max_layers, tp_mult, range_tree):
+    """Event-driven backtest; avoids scanning all 500k candles per setup."""
     close = df["close"].to_numpy()
     ts = df["timestamp"].to_numpy()
 
-    down_ends = {
+    down_ends = [
         e for _, e, pct, ta, tb in leg_stats(pivots)
         if ta == "H" and tb == "L" and pct >= MIN_LEG_PCT
-    }
+    ]
     if not down_ends:
         return None
 
     trades = []
-    cash = 1.0
-    btc = 0.0
-    spent = 0.0
-    anchor = None
+    cash, btc, spent = 1.0, 0.0, 0.0
     layers = 0
-    peak = cash
-    max_dd = 0.0
+    peak, max_dd = cash, 0.0
 
-    for i, p in enumerate(close):
-        if p < MIN_PRICE:
+    for anchor_i in down_ends:
+        if layers or close[anchor_i] < MIN_PRICE:
             continue
 
-        if i in down_ends and layers == 0:
-            anchor = p
-            allocation = cash / max_layers
-            btc = allocation / p
-            cash -= allocation
-            spent = allocation
-            layers = 1
+        anchor = float(close[anchor_i])
+        allocation = cash / max_layers
+        btc = allocation / anchor
+        cash -= allocation
+        spent = allocation
+        layers = 1
+        current_i = anchor_i
 
-        if anchor is None:
-            continue
-
-        step = (
-            spacing_value / 100.0
-            if spacing_type == "pct"
-            else spacing_value / anchor
-        )
-
-        buy_level = anchor * (1.0 - step * (layers + 1))
-        if layers < max_layers and p <= buy_level and cash > 0:
-            allocation = cash / (max_layers - layers)
-            btc += allocation / p
-            cash -= allocation
-            spent += allocation
-            layers += 1
-
-        if layers:
+        while layers:
+            step = spacing_value / 100.0 if spacing_type == "pct" else spacing_value / anchor
+            buy_level = anchor * (1.0 - step * (layers + 1))
             avg = spent / btc
             tp = avg * (1.0 + step * tp_mult)
-            if p >= tp:
-                proceeds = btc * p
-                pnl = proceeds - spent
-                cash += proceeds
-                trades.append({
-                    "timestamp": ts[i],
-                    "pnl": pnl,
-                    "return": pnl / spent,
-                    "layers": layers,
-                    "avg_entry": avg,
-                    "exit": p,
-                })
-                btc = 0.0
-                spent = 0.0
-                layers = 0
-                anchor = None
 
-        equity = cash + btc * p
-        peak = max(peak, equity)
-        max_dd = max(max_dd, (peak - equity) / peak)
+            buy_i = range_tree.first_le(current_i + 1, buy_level) if layers < max_layers else None
+            tp_i = range_tree.first_ge(current_i + 1, tp)
+
+            if buy_i is None and tp_i is None:
+                equity = cash + btc * float(close[-1])
+                peak = max(peak, equity)
+                max_dd = max(max_dd, (peak - equity) / peak)
+                break
+
+            if buy_i is not None and (tp_i is None or buy_i <= tp_i):
+                p = float(close[buy_i])
+                allocation = cash / (max_layers - layers)
+                btc += allocation / p
+                cash -= allocation
+                spent += allocation
+                layers += 1
+                current_i = buy_i
+                equity = cash + btc * p
+                peak = max(peak, equity)
+                max_dd = max(max_dd, (peak - equity) / peak)
+                continue
+
+            p = float(close[tp_i])
+            proceeds = btc * p
+            pnl = proceeds - spent
+            cash += proceeds
+            trades.append({
+                "timestamp": ts[tp_i],
+                "pnl": pnl,
+                "return": pnl / spent,
+                "layers": layers,
+                "avg_entry": spent / btc,
+                "exit": p,
+            })
+            btc, spent, layers = 0.0, 0.0, 0
+            current_i = tp_i
 
     if not trades:
         return None
 
     tr = pd.DataFrame(trades)
-    monthly = (
-        tr.assign(month=pd.to_datetime(tr.timestamp).dt.to_period("M"))
-        .groupby("month")["pnl"]
-        .sum()
-    )
+    month = pd.to_datetime(tr["timestamp"], utc=True).dt.tz_localize(None).dt.to_period("M")
+    monthly = tr.assign(month=month).groupby("month")["pnl"].sum()
 
     return {
         "trades": len(tr),
@@ -234,6 +266,7 @@ def main():
     )
 
     close = df["close"].to_numpy()
+    range_tree = RangeTree(close)
     zz_rows = []
 
     for depth, dev, backstep in itertools.product(
@@ -281,13 +314,9 @@ def main():
         backstep = int(z["backstep"])
         piv = zigzag_pivots(close, dev / 100.0, depth, backstep)
 
-        for st, sv, ml, tm in itertools.product(
-            ["pct", "usd"],
-            SPACING_PCT + SPACING_USD,
-            MAX_LAYERS,
-            TP_MULTIPLES,
-        ):
-            r = run_grid(df, piv, st, sv, ml, tm)
+        for st, spacings in [("pct", SPACING_PCT), ("usd", SPACING_USD)]:
+            for sv, ml, tm in itertools.product(spacings, MAX_LAYERS, TP_MULTIPLES):
+                r = run_grid(df, piv, st, sv, ml, tm, range_tree)
             if r:
                 rows.append({
                     "depth": depth,
