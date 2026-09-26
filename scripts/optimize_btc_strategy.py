@@ -239,13 +239,17 @@ def run_grid(df, pivots, spacing_type, spacing_value, max_layers, tp_mult, range
     if not trades:
         return None
 
+    # Mark any still-open BTC position to market at the final close.
+    final_equity = cash + btc * float(close[-1])
+    total_return_pct = (final_equity - 1.0) * 100
+
     tr = pd.DataFrame(trades)
     month = pd.to_datetime(tr["timestamp"], utc=True).dt.tz_localize(None).dt.to_period("M")
     monthly = tr.assign(month=month).groupby("month")["pnl"].sum()
 
     return {
         "trades": len(tr),
-        "total_return_pct": (cash - 1.0) * 100,
+        "total_return_pct": total_return_pct,
         "avg_monthly_return_pct": monthly.mean() * 100,
         "median_monthly_return_pct": monthly.median() * 100,
         "best_month_pct": monthly.max() * 100,
